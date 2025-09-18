@@ -1,24 +1,29 @@
+// routes/upload.js
 import express from 'express';
 import multer from 'multer';
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import { v4 as uuidv4 } from 'uuid';
 import OpenAI from "openai";
-import fetch from "node-fetch"; // only needed if your Node version <18
 import { safeUnlink } from './utils.js';
+import { getPool } from './db.js';
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const router = express.Router();
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 200 * 1024 * 1024 } // 200MB limit
+  limits: { fileSize: 200 * 1024 * 1024 }
 });
 
+// ------------------------------
+// AWS Clients
+// ------------------------------
 const s3Client = new S3Client({
   region: process.env.AWS_REGION,
   credentials: {
@@ -27,10 +32,19 @@ const s3Client = new S3Client({
   }
 });
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY, // DO NOT hardcode
+const sesClient = new SESClient({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
+  }
 });
 
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ------------------------------
+// Helpers
+// ------------------------------
 async function uploadBufferToS3(buffer, key, contentType = 'audio/webm') {
   const Bucket = process.env.S3_BUCKET;
   if (!Bucket) throw new Error('S3_BUCKET env required');
@@ -51,9 +65,7 @@ function mergeAudioFiles(inputPaths, outPath) {
     inputPaths.forEach(p => proc.input(p));
 
     proc
-      .complexFilter([
-        `amix=inputs=${inputPaths.length}:duration=longest:dropout_transition=2`
-      ])
+      .complexFilter([`amix=inputs=${inputPaths.length}:duration=longest:dropout_transition=2`])
       .outputOptions(['-c:a libmp3lame', '-q:a 2'])
       .on('end', () => resolve())
       .on('error', (err) => reject(err))
@@ -61,150 +73,197 @@ function mergeAudioFiles(inputPaths, outPath) {
   });
 }
 
-router.options('/', (req, res) => res.sendStatus(204));
+// 📨 Send Email via SES
+async function sendAnalysisEmail(toEmail, summary, soap, tips) {
+  const fromEmail = process.env.FROM_EMAIL; // ✅ must be verified in SES
+  if (!fromEmail) throw new Error("FROM_EMAIL env required for SES");
 
-// Upload 2 or more audios: will return both originals + merged
-// Replace your current router.post('/', ...) with this block
+  const params = {
+    Source: fromEmail,
+    Destination: { ToAddresses: [toEmail] },
+    Message: {
+      Subject: { Data: "Meeting Analysis Report" },
+      Body: {
+        Text: {
+          Data: `Hello,
 
+Here is the analysis of your recent meeting:
+
+📌 Summary:
+${summary}
+
+📑 SOAP Notes:
+${soap}
+
+💡 Therapy Recommendations:
+${tips}
+
+Thanks,
+Your Meeting Assistant`
+        }
+      }
+    }
+  };
+
+  const command = new SendEmailCommand(params);
+  await sesClient.send(command);
+}
+
+// ------------------------------
+// Route
+// ------------------------------
 router.post('/', upload.any(), async (req, res) => {
   const tmpPaths = [];
   try {
     const files = req.files || [];
-    if (!files.length) {
-      return res.status(400).json({ ok: false, error: 'No files uploaded' });
-    }
+    if (!files.length) return res.status(400).json({ ok: false, error: 'No files uploaded' });
 
-    // Separate mic + remotes
     const userAudio = files.find(f => f.fieldname === 'user_audio');
     const remotes = files.filter(f => f.fieldname.startsWith('remote_'));
+    if (!userAudio) return res.status(400).json({ ok: false, error: 'user_audio required' });
 
-    if (!userAudio) {
-      return res.status(400).json({ ok: false, error: 'user_audio required' });
+    const meetingDataBlob = files.find(f => f.fieldname === 'meetingData');
+    let meetingData = null;
+    if (meetingDataBlob) {
+      const str = meetingDataBlob.buffer.toString();
+      meetingData = JSON.parse(str);
     }
 
-    // Extract metadata (not files)
-    const { meetUrl, timestamp } = req.body;
-
-    // Write temp files (user + remotes)
     for (const f of [userAudio, ...remotes]) {
       const tmpPath = path.join(os.tmpdir(), `${Date.now()}-${uuidv4()}-${f.originalname}`);
       await fs.promises.writeFile(tmpPath, f.buffer);
       tmpPaths.push(tmpPath);
     }
 
-    // Merge into outPath
     const outName = `merged-${Date.now()}-${uuidv4()}.mp3`;
     const outPath = path.join(os.tmpdir(), outName);
     await mergeAudioFiles(tmpPaths, outPath);
 
-    // read merged buffer and upload to S3
     const mergedBuffer = await fs.promises.readFile(outPath);
     const mergedKey = `meet-recordings/${outName}`;
     const mergedS3 = await uploadBufferToS3(mergedBuffer, mergedKey, 'audio/mpeg');
 
-    // Upload originals
     const originals = [];
     for (const f of files) {
+      if (f.fieldname === 'meetingData') continue;
       const key = `meet-recordings/originals/${Date.now()}-${f.originalname}`;
       const s3path = await uploadBufferToS3(f.buffer, key, f.mimetype || 'audio/webm');
       originals.push({ field: f.fieldname, key, s3: s3path });
     }
 
-    // ------------------------------
-    // Transcribe with Whisper (Node: use fs.createReadStream)
-    // ------------------------------
+    // 🎙 Whisper
     let transcriptText = '';
     try {
-      console.log('⏳ Sending merged audio to Whisper for transcription...');
       const transcriptResp = await openai.audio.transcriptions.create({
         file: fs.createReadStream(outPath),
-        model: "whisper-1",
+        model: "gpt-4o-mini",
         response_format: "text"
       });
-
-      // transcriptResp may be a string or an object depending on SDK/version
-      if (typeof transcriptResp === 'string') {
-        transcriptText = transcriptResp;
-      } else if (transcriptResp && typeof transcriptResp === 'object') {
-        // Common shapes: { text: "..." } or { transcription: "..." }
-        transcriptText = transcriptResp.text ?? transcriptResp.transcription ?? JSON.stringify(transcriptResp);
-      } else {
-        transcriptText = String(transcriptResp);
-      }
-      console.log("🎙️ Transcript (first 300 chars):", transcriptText.slice(0, 300));
+      transcriptText = typeof transcriptResp === 'string'
+        ? transcriptResp
+        : transcriptResp.text ?? transcriptResp.transcription ?? JSON.stringify(transcriptResp);
     } catch (err) {
-      console.error('❌ Whisper transcription failed:', err);
-      throw err;
+      console.error('❌ Whisper failed:', err);
     }
 
-    // ------------------------------
-    // Run analysis prompts (GPT)
-    // ------------------------------
-    const prompt_summary = `You are an expert clinical assistant. Summarize the following session transcript in clear, concise language. Highlight the main themes, client concerns, and any significant progress or challenges. Keep the summary factual and professional, no personal opinions and everything in English.\n\nTranscript: `;
-    const prompt_soap = `You are a mental health professional writing SOAP notes. Generate structured SOAP notes from the transcript below:\n\nS (Subjective): Client’s self-reported concerns, feelings, and symptoms.\nO (Objective): Observable behaviors, mood, and clinician’s observations.\nA (Assessment): Clinical impressions, patterns, and progress.\nP (Plan): Next steps, interventions, or recommendations.\n\nEnsure clarity, professionalism, and avoid adding details not in the transcript.\n\nTranscript: `;
-    const prompt_tips = `You are a therapist providing guidance. Based on the transcript below, generate treatment tips and practical recommendations tailored to the client. Keep them empathetic, actionable, and evidence-based. Focus on coping strategies, skill-building, and next steps.\n\nTranscript: `;
-
+    // 🤖 GPT Analysis
     async function runPrompt(prompt, transcript) {
-      try {
-        console.log('⏳ Sending prompt to GPT (preview):', prompt.slice(0, 80));
-        const resp = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages: [{ role: "user", content: prompt + transcript }]
-        });
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt + transcript }]
+      });
+      return resp?.choices?.[0]?.message?.content ?? "";
+    }
 
-        // defensive extraction
-        const content =
-          resp?.choices?.[0]?.message?.content ??
-          resp?.choices?.[0]?.text ??
-          (typeof resp === 'string' ? resp : JSON.stringify(resp));
-        return content;
-      } catch (err) {
-        console.error('❌ OpenAI prompt failed:', err);
-        throw err;
+    const summary = await runPrompt("Summarize this transcript:\n\n", transcriptText);
+    const soap = await runPrompt("Write SOAP notes for transcript:\n\n", transcriptText);
+    const tips = await runPrompt("Give therapy recommendations for transcript:\n\n", transcriptText);
+
+    // ------------------------------
+    // 💾 Save to DB
+    // ------------------------------
+    let hostEmail = null;
+    if (meetingData) {
+      const pool = getPool();
+      const profile = meetingData.userProfile;
+      let userId = null;
+
+      if (profile?.email) {
+        const u = await pool.query(
+          `INSERT INTO users (email, name, image, given_name, family_name, email_verified)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (email) DO UPDATE SET
+             name=EXCLUDED.name, image=EXCLUDED.image,
+             given_name=EXCLUDED.given_name, family_name=EXCLUDED.family_name,
+             email_verified=EXCLUDED.email_verified, updated_at=NOW()
+           RETURNING id`,
+          [profile.email, profile.name, profile.picture, profile.given_name, profile.family_name, profile.email_verified]
+        );
+        userId = u.rows[0].id;
+        hostEmail = profile.email; // ✅ Host email
+      }
+
+      const m = await pool.query(
+        `INSERT INTO meetings (meeting_code, meeting_title, meet_url, user_id, duration_ms, raw_json)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [
+          meetingData.meetingInfo.meetingCode,
+          meetingData.meetingInfo.meetingTitle,
+          meetingData.meetingInfo.meetUrl,
+          userId,
+          meetingData.durationMs,
+          {
+            ...meetingData,
+            audio: { mergedS3, originals },
+            analysis: { transcript: transcriptText, summary, soap, tips }
+          }
+        ]
+      );
+      const meetingId = m.rows[0].id;
+
+      if (meetingData.participants) {
+        for (const p of meetingData.participants) {
+          await pool.query(
+            `INSERT INTO participants (meeting_id,name,join_time) VALUES ($1,$2,$3)`,
+            [meetingId, p.name, p.joinTime]
+          );
+        }
+      }
+
+      if (meetingData.engagement) {
+        for (const e of meetingData.engagement) {
+          await pool.query(
+            `INSERT INTO engagement_signals (meeting_id,participant_name,video_on) VALUES ($1,$2,$3)`,
+            [meetingId, e.name, e.videoOn]
+          );
+        }
       }
     }
 
-    const summary = await runPrompt(prompt_summary, transcriptText);
-    console.log("📄 Summary (first 300 chars):", summary?.slice(0, 300));
+    // ------------------------------
+    // ✉️ Send Email to Host
+    // ------------------------------
+    if (hostEmail) {
+      try {
+        await sendAnalysisEmail(hostEmail, summary, soap, tips);
+        console.log(`📨 Email sent to host: ${hostEmail}`);
+      } catch (err) {
+        console.error("❌ Email sending failed:", err);
+      }
+    }
 
-    const soap = await runPrompt(prompt_soap, transcriptText);
-    console.log("🧾 SOAP (first 300 chars):", soap?.slice(0, 300));
-
-    const tips = await runPrompt(prompt_tips, transcriptText);
-    console.log("💡 Tips (first 300 chars):", tips?.slice(0, 300));
-
-    // respond
     res.json({
       ok: true,
       merged: mergedS3,
       originals,
-      meta: { meetUrl, timestamp },
-      analysis: {
-        transcript: transcriptText,
-        summary,
-        soap,
-        tips
-      }
+      analysis: { transcript: transcriptText, summary, soap, tips }
     });
-
   } catch (err) {
-    console.error('🔥 Upload route error:', err);
-    return res.status(500).json({
-      ok: false,
-      error: err.message || String(err),
-      stack: err.stack
-    });
+    console.error('🔥 Upload error:', err);
+    res.status(500).json({ ok: false, error: err.message });
   } finally {
-    // always cleanup tmp files (and merged)
-    try {
-      await Promise.all(tmpPaths.map(p => safeUnlink(p)));
-    } catch (e) {
-      console.warn('cleanup warning', e);
-    }
+    try { await Promise.all(tmpPaths.map(p => safeUnlink(p))); } catch {}
   }
 });
-
-
-
 
 export default router;
