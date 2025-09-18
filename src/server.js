@@ -43,6 +43,7 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 // mount routers
+app.use('/', "Hello World");
 app.use('/api/auth', authRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/health', healthRouter);
